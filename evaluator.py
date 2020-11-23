@@ -1,20 +1,27 @@
 import os
 import json
-import requests
+import time
 from langdetect import detect
 import nltk
 from nltk.stem import WordNetLemmatizer 
 import re
+from pyspark import SparkContext
+from pyspark.streaming import StreamingContext
+from pyspark import SQLContext
+import emoji
+from collections import namedtuple
 
 lemmatizer = WordNetLemmatizer()
+sentiment_dictionary = {}
+emoji_sentiment_dictionary = {}
+with open('emoji_sentiment.json') as j:
+    emoji_sentiment_dictionary = json.load(j)
 
 def auth():
     return os.environ.get("BEARER_TOKEN")
 
-
 def create_url():
     return "https://api.twitter.com/2/tweets/sample/stream"
-
 
 def create_headers(bearer_token):
     headers = {"Authorization": "Bearer {}".format(bearer_token)}
@@ -25,18 +32,15 @@ def is_url(text):
         return True
     return False
 
+def lemmatize(text):
+    return [lemmatizer.lemmatize(token.lower()) for token in text]
+
 def tokenize(text):
-    no_urls = " ".join([word for word in text.split() if not is_url(word)])
-    return re.split(r'[^a-zA-Z0-9@#-\'\\/_]+', no_urls)
+    text = " ".join([word for word in text.split() if not is_url(word)])
+    return re.findall(r'[a-zA-Z0-9@#-\'\\/_]+', text)
 
-def get_symbols(text):
-    return [fix_emoji(char) for char in text if ord(char)>127]
-
-def get_hashtags(text):
-    return re.findall('#[^ ]+', text)
-
-def get_ats(text):
-    return re.findall(r'RT @[^:]+|@[^ ]+', text)
+def get_emojis(text):
+    return [fix_emoji(c) for c in text if c in emoji.UNICODE_EMOJI]
 
 stopwords = [
     "RT",
@@ -173,26 +177,16 @@ def remove_stopwords(text):
     to_remove = '|'.join(stopwords)
     regex = re.compile(r'\b('+to_remove+r')\b', flags=re.IGNORECASE)
     return regex.sub("", text)
-
-sentiment_dictionary = {}
-symbol_sentiment_dictionary = {}
-with open('emoji_sentiment.json') as j:
-    symbol_sentiment_dictionary = json.load(j)
-
-def process_tweet(tweet):
-    text = tweet["data"]["text"]
     
-    # filter tweets in english
+def language_filter(text, lang):
     try:
-        if detect(text) != 'en':
-            return
+        if detect(text) == lang:
+            return True
     except:
-        return
+        return False
+    return False
 
-    # print(json.dumps(tweet, indent=4, sort_keys=True))
-    # print the tweet
-    print(text)
-
+def process_tweet(text):
     sentiment_value = 0
     words = 0
 
@@ -209,37 +203,18 @@ def process_tweet(tweet):
         if not re.search(r'[^a-zA-Z]', token):
             words+=1
 
-    for symbol in get_symbols(text):
-        if symbol in symbol_sentiment_dictionary:
-            symbol_sentiment = symbol_sentiment_dictionary[symbol]["positive-emotion"] - symbol_sentiment_dictionary[symbol]["negative-emotion"]
-            sentiment_value += symbol_sentiment
+    for emoji in get_emojis(text):
+        if emoji in emoji_sentiment_dictionary:
+            emoji_sentiment = emoji_sentiment_dictionary[emoji]["positive-emotion"] - emoji_sentiment_dictionary[emoji]["negative-emotion"]
+            sentiment_value += emoji_sentiment
             words+=1
         
 
     if words == 0:
         words = 1
-    print("SENTIMENT EVALUATION: {}".format(sentiment_value/words))
 
-
-
-    # print("symbols: {}".format(get_symbols(text)))
-    # print("hashtags: {}".format(get_hashtags(text)))
-    # print("mentions: {}".format(get_ats(text)))
-    print("\n\n")
-
-def connect_to_endpoint(url, headers):
-    response = requests.request("GET", url, headers=headers, stream=True)
-    print(response.status_code)
-    for response_line in response.iter_lines():
-        if response_line:
-            json_response = json.loads(response_line)
-            process_tweet(json_response)
-    if response.status_code != 200:
-        raise Exception(
-            "Request returned an error: {} {}".format(
-                response.status_code, response.text
-            )
-        )
+    senteval = sentiment_value/words
+    return senteval
 
 def fix_emoji(emoji):
     ret = re.sub(br".*(\\[^\\]*)$", br'\1' ,emoji.encode('unicode-escape')).decode('unicode-escape')
@@ -264,14 +239,47 @@ def main():
         polarity = re.sub(r'.*priorpolarity=([a-z]+)\n', r'\1', line)
         sentiment_dictionary[word] = translate[polarity] * translate[subjectivity]
 
-    bearer_token = auth()
-    url = create_url()
-    headers = create_headers(bearer_token)
-    timeout = 0
-    while True:
-        connect_to_endpoint(url, headers)
-        timeout += 1
+    spark = SparkContext("local[4]", "sentimento")
+    spark.setLogLevel("ERROR")
+    sqlc = SQLContext(spark)
+    ssc = StreamingContext(spark, 10)
+    ssc.checkpoint("checkpoint")
 
+    socketStream = ssc.socketTextStream("localhost", 5050)
+
+    fields = ('text', 'sentiment')
+    Tweet = namedtuple('Tweet', fields)
+
+    evaluated = socketStream.filter(lambda tweet: language_filter(tweet, 'en'))\
+        .map(lambda tweet: (tweet, process_tweet(tweet)))\
+        .map(lambda tweet: Tweet(tweet[0], tweet[1]))
+
+    evaluated.window(30,20).foreachRDD(lambda rdd: rdd.toDF().registerTempTable("tweets"))
+
+    print("Starting spark")
+    ssc.start()
+
+    print("Processing tweets...")
+    time.sleep(30)
+    while True:
+        window = 0
+        time.sleep(20)
+        df = sqlc.sql('Select * from tweets').toPandas()
+        df.to_csv("data_{}.csv".format(window))
+        print("5 most positive comments:")
+        print(df.nlargest(5, 'sentiment'))
+        print("\n5 most negative comments:")
+        print(df.nsmallest(5, 'sentiment'))
+
+
+        print('Average sentiment of tweets: {}'.format(df['sentiment'].mean()))
+
+        window+=1
+        
+    ssc.awaitTermination()
+
+
+    # print("Average sentiment for given track {}".format(total_sentiment/tweet_count))
 
 if __name__ == "__main__":
     main()
